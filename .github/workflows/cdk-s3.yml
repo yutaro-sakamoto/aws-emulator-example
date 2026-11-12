@@ -1,0 +1,78 @@
+name: cdk-s3 on AWS Emulator
+
+on:
+  push:
+    paths:
+      - "cdk-s3/**"
+      - ".github/workflows/cdk-s3.yml"
+  pull_request:
+    paths:
+      - "cdk-s3/**"
+      - ".github/workflows/cdk-s3.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: cdk-s3
+    env:
+      EMULATOR_PORT: "9297"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cdk-s3/package-lock.json
+
+      - name: Install AWS Emulator (latest)
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -fsSLo aws-emulator.deb \
+            https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator_amd64.deb
+          sudo apt-get install -y ./aws-emulator.deb
+          echo /opt/aws-emulator/bin >> "$GITHUB_PATH"
+
+      - name: Start AWS Emulator
+        run: |
+          aws-emulator -v
+          mkdir -p ~/.aws/emulator
+          # CI ではテレメトリを無効化し、停止し忘れに備えて idle timeout を付ける
+          nohup aws-emulator -p "$EMULATOR_PORT" -t off --idle-timeout 900 \
+            > ~/.aws/emulator/"$EMULATOR_PORT".log 2>&1 &
+          for i in $(seq 30); do
+            curl -sf --cacert ~/.aws/emulator/"$EMULATOR_PORT"/ca.pem \
+              https://127.0.0.1:"$EMULATOR_PORT"/__admin/health && exit 0
+            sleep 1
+          done
+          echo "AWS Emulator did not become healthy" >&2
+          cat ~/.aws/emulator/"$EMULATOR_PORT".log >&2
+          exit 1
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and unit test
+        run: |
+          npm run build
+          npm test
+
+      - name: Deploy to AWS Emulator
+        run: ./scripts/deploy.sh
+
+      - name: Upload / download test
+        run: ./scripts/test-upload-download.sh
+
+      - name: Destroy stack
+        run: ./scripts/destroy.sh
+
+      - name: Show emulator log on failure
+        if: failure()
+        run: cat ~/.aws/emulator/"$EMULATOR_PORT".log || true
